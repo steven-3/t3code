@@ -21,6 +21,7 @@ import type {
   ThreadSession,
   TurnDiffSummary,
 } from "./types";
+import type { WorkflowRun } from "./lib/workflowRuns";
 
 export type ProviderPickerKind = ProviderDriverKind;
 
@@ -137,6 +138,12 @@ export type TimelineEntry =
       kind: "work";
       createdAt: string;
       entry: WorkLogEntry;
+    }
+  | {
+      id: string;
+      kind: "workflow";
+      createdAt: string;
+      run: WorkflowRun;
     };
 
 export function workLogEntryIsToolLike(entry: WorkLogEntry): boolean {
@@ -626,13 +633,23 @@ export function hasActionableProposedPlan(
 
 export function deriveWorkLogEntries(
   activities: ReadonlyArray<OrchestrationThreadActivity>,
+  options?: {
+    /**
+     * Background runs rendered as their own card. Their per-agent frames would
+     * otherwise flood the work log with one row per update.
+     */
+    readonly hiddenTaskIds?: ReadonlySet<string>;
+  },
 ): WorkLogEntry[] {
   const ordered = [...activities].toSorted(compareActivitiesByOrder);
+  const hiddenTaskIds = options?.hiddenTaskIds;
   const entries: DerivedWorkLogEntry[] = [];
   for (const activity of ordered) {
     if (activity.kind === "tool.started") continue;
     if (activity.kind === "task.started") continue;
     if (activity.kind === "context-window.updated") continue;
+    if (hiddenTaskIds && hiddenTaskIds.size > 0 && isHiddenTaskActivity(activity, hiddenTaskIds))
+      continue;
     if (activity.summary === "Checkpoint captured") continue;
     if (isPlanBoundaryToolActivity(activity)) continue;
     entries.push(toDerivedWorkLogEntry(activity));
@@ -641,6 +658,24 @@ export function deriveWorkLogEntries(
     const { activityKind, collapseKey: _collapseKey, ...rest } = entry;
     return Object.assign(rest, { sourceActivityKind: activityKind });
   });
+}
+
+function isHiddenTaskActivity(
+  activity: OrchestrationThreadActivity,
+  hiddenTaskIds: ReadonlySet<string>,
+): boolean {
+  if (
+    activity.kind !== "task.progress" &&
+    activity.kind !== "task.updated" &&
+    activity.kind !== "task.completed"
+  ) {
+    return false;
+  }
+  const payload =
+    activity.payload && typeof activity.payload === "object"
+      ? (activity.payload as { taskId?: unknown })
+      : null;
+  return typeof payload?.taskId === "string" && hiddenTaskIds.has(payload.taskId);
 }
 
 function isPlanBoundaryToolActivity(activity: OrchestrationThreadActivity): boolean {
@@ -1341,6 +1376,7 @@ export function deriveTimelineEntries(
   messages: ReadonlyArray<ChatMessage>,
   proposedPlans: ReadonlyArray<ProposedPlan>,
   workEntries: ReadonlyArray<WorkLogEntry>,
+  workflowRuns: ReadonlyArray<WorkflowRun> = [],
 ): TimelineEntry[] {
   const messageRows: TimelineEntry[] = messages.map((message) => ({
     id: message.id,
@@ -1360,7 +1396,15 @@ export function deriveTimelineEntries(
     createdAt: entry.createdAt,
     entry,
   }));
-  return [...messageRows, ...proposedPlanRows, ...workRows].toSorted((a, b) =>
+  // Anchored where the run was launched, so the card sits with the tool call
+  // that started it rather than jumping as agents report in.
+  const workflowRows: TimelineEntry[] = workflowRuns.map((run) => ({
+    id: `workflow:${run.taskId}`,
+    kind: "workflow",
+    createdAt: run.startedAt,
+    run,
+  }));
+  return [...messageRows, ...proposedPlanRows, ...workRows, ...workflowRows].toSorted((a, b) =>
     a.createdAt.localeCompare(b.createdAt),
   );
 }

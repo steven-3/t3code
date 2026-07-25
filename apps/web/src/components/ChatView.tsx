@@ -138,6 +138,7 @@ import { DiffWorkerPoolProvider } from "./DiffWorkerPoolProvider";
 import { BranchToolbar } from "./BranchToolbar";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import PlanSidebar from "./PlanSidebar";
+import WorkflowsPanel from "./WorkflowsPanel";
 import ThreadTerminalDrawer from "./ThreadTerminalDrawer";
 import {
   AlarmClockIcon,
@@ -163,6 +164,8 @@ import { getProviderModelCapabilities, resolveSelectableProvider } from "../prov
 import { NO_PROVIDER_MODEL_SELECTION } from "../providerInstances";
 import { useClientSettings, useEnvironmentSettings } from "../hooks/useSettings";
 import { useNowMinute } from "../hooks/useNowMinute";
+import { useTickingNow } from "../hooks/useTickingNow";
+import { deriveWorkflowRunCards, workflowRunTaskIds } from "../lib/workflowRuns";
 import { resolveAppModelSelectionForInstance } from "../modelSelection";
 import { getTerminalFocusOwner } from "../lib/terminalFocus";
 import { resolveNewDraftStartFromOrigin } from "../lib/chatThreadActions";
@@ -1925,7 +1928,22 @@ function ChatViewContent(props: ChatViewProps) {
   const selectedProvider: ProviderDriverKind = lockedProvider ?? unlockedSelectedProvider;
   const phase = derivePhase(activeThread?.session ?? null);
   const threadActivities = activeThread?.activities ?? EMPTY_ACTIVITIES;
-  const workLogEntries = useMemo(() => deriveWorkLogEntries(threadActivities), [threadActivities]);
+  // Runs are re-derived on a slow tick so "running for 4m" and idle agents age
+  // without a provider event; the clock stops once nothing is running.
+  const hasRunningWorkflow = useMemo(
+    () => deriveWorkflowRunCards(threadActivities, 0).some((run) => run.status === "running"),
+    [threadActivities],
+  );
+  const workflowClockNow = useTickingNow(hasRunningWorkflow);
+  const workflowRuns = useMemo(
+    () => deriveWorkflowRunCards(threadActivities, workflowClockNow),
+    [threadActivities, workflowClockNow],
+  );
+  const workflowTaskIds = useMemo(() => workflowRunTaskIds(workflowRuns), [workflowRuns]);
+  const workLogEntries = useMemo(
+    () => deriveWorkLogEntries(threadActivities, { hiddenTaskIds: workflowTaskIds }),
+    [threadActivities, workflowTaskIds],
+  );
   const pendingApprovals = useMemo(
     () => derivePendingApprovals(threadActivities),
     [threadActivities],
@@ -2259,8 +2277,13 @@ function ChatViewContent(props: ChatViewProps) {
   }, [attachmentPreviewHandoffByMessageId, displayServerMessages, optimisticUserMessages]);
   const timelineEntries = useMemo(
     () =>
-      deriveTimelineEntries(timelineMessages, activeThread?.proposedPlans ?? [], workLogEntries),
-    [activeThread?.proposedPlans, timelineMessages, workLogEntries],
+      deriveTimelineEntries(
+        timelineMessages,
+        activeThread?.proposedPlans ?? [],
+        workLogEntries,
+        workflowRuns,
+      ),
+    [activeThread?.proposedPlans, timelineMessages, workLogEntries, workflowRuns],
   );
   const [dockedDraftHeroThreadKey, setDockedDraftHeroThreadKey] = useState<string | null>(null);
   const draftHeroDockRequested =
@@ -3007,6 +3030,10 @@ function ChatViewContent(props: ChatViewProps) {
     if (!activeThreadRef || !activeProject) return;
     useRightPanelStore.getState().open(activeThreadRef, "files");
   }, [activeProject, activeThreadRef]);
+  const addWorkflowsSurface = useCallback(() => {
+    if (!activeThreadRef || workflowRuns.length === 0) return;
+    useRightPanelStore.getState().open(activeThreadRef, "workflows");
+  }, [activeThreadRef, workflowRuns.length]);
   const openFileSurface = useCallback(
     (relativePath: string) => {
       if (!activeThreadRef || !activeProject) return;
@@ -5580,6 +5607,8 @@ function ChatViewContent(props: ChatViewProps) {
         timestampFormat={timestampFormat}
         mode="embedded"
       />
+    ) : activeRightPanelSurface?.kind === "workflows" ? (
+      <WorkflowsPanel runs={workflowRuns} mode="embedded" />
     ) : (activeRightPanelSurface?.kind === "files" || activeRightPanelSurface?.kind === "file") &&
       activeProject &&
       activeWorkspaceRoot ? (
@@ -5997,9 +6026,11 @@ function ChatViewContent(props: ChatViewProps) {
           onAddTerminal={addTerminalSurface}
           onAddDiff={addDiffSurface}
           onAddFiles={addFilesSurface}
+          onAddWorkflows={addWorkflowsSurface}
           browserAvailable={isPreviewSupportedInRuntime()}
           diffAvailable={isServerThread && isGitRepo}
           filesAvailable={activeProject !== null}
+          workflowsAvailable={workflowRuns.length > 0}
         >
           {rightPanelContent}
         </RightPanelTabs>
@@ -6024,9 +6055,11 @@ function ChatViewContent(props: ChatViewProps) {
             onAddTerminal={addTerminalSurface}
             onAddDiff={addDiffSurface}
             onAddFiles={addFilesSurface}
+            onAddWorkflows={addWorkflowsSurface}
             browserAvailable={isPreviewSupportedInRuntime()}
             diffAvailable={isServerThread && isGitRepo}
             filesAvailable={activeProject !== null}
+            workflowsAvailable={workflowRuns.length > 0}
           >
             {rightPanelContent}
           </RightPanelTabs>

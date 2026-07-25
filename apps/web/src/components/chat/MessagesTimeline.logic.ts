@@ -7,6 +7,7 @@ import {
   type WorkLogEntry,
 } from "../../session-logic";
 import { type ChatMessage, type ProposedPlan, type TurnDiffSummary } from "../../types";
+import { type WorkflowRun } from "../../lib/workflowRuns";
 import { type MessageId, type OrchestrationLatestTurn, type TurnId } from "@t3tools/contracts";
 
 export const MAX_VISIBLE_WORK_LOG_ENTRIES = 1;
@@ -174,6 +175,12 @@ export type MessagesTimelineRow =
       id: string;
       createdAt: string;
       proposedPlan: ProposedPlan;
+    }
+  | {
+      kind: "workflow";
+      id: string;
+      createdAt: string;
+      run: WorkflowRun;
     }
   | { kind: "working"; id: string; createdAt: string | null };
 
@@ -527,6 +534,16 @@ export function deriveMessagesTimelineRows(input: {
       continue;
     }
 
+    if (timelineEntry.kind === "workflow") {
+      nextRows.push({
+        kind: "workflow",
+        id: timelineEntry.id,
+        createdAt: timelineEntry.createdAt,
+        run: timelineEntry.run,
+      });
+      continue;
+    }
+
     const assistantTurnStillInProgress =
       timelineEntry.message.role === "assistant" &&
       unsettledTurnId !== null &&
@@ -609,6 +626,9 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
 
     case "proposed-plan":
       return a.proposedPlan === (b as typeof a).proposedPlan;
+
+    case "workflow":
+      return a.run === (b as typeof a).run;
 
     case "work":
       return Equal.equals(a.groupedEntries, (b as typeof a).groupedEntries);

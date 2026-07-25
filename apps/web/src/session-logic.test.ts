@@ -740,6 +740,35 @@ describe("deriveWorkLogEntries", () => {
     expect(entries.map((entry) => entry.id)).toEqual(["task-progress", "task-complete"]);
   });
 
+  it("hides task rows for runs a workflow card already renders", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "wf-progress",
+        createdAt: "2026-02-23T00:00:02.000Z",
+        kind: "task.progress",
+        summary: "Backend: py:signals",
+        tone: "info",
+        payload: { taskId: "wf-1" },
+      }),
+      makeActivity({
+        id: "shell-progress",
+        createdAt: "2026-02-23T00:00:03.000Z",
+        kind: "task.progress",
+        summary: "Running tests",
+        tone: "info",
+        payload: { taskId: "sh-1" },
+      }),
+    ];
+
+    const entries = deriveWorkLogEntries(activities, { hiddenTaskIds: new Set(["wf-1"]) });
+    expect(entries.map((entry) => entry.id)).toEqual(["shell-progress"]);
+    // Without the hint every row still shows: suppression is opt-in.
+    expect(deriveWorkLogEntries(activities).map((entry) => entry.id)).toEqual([
+      "wf-progress",
+      "shell-progress",
+    ]);
+  });
+
   it("uses payload summary as label for task entries when available", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({
@@ -1535,6 +1564,50 @@ describe("deriveTimelineEntries", () => {
         implementedAt: null,
         implementationThreadId: null,
       },
+    });
+  });
+
+  it("anchors workflow runs where they were launched", () => {
+    const entries = deriveTimelineEntries(
+      [],
+      [],
+      [
+        {
+          id: "work-1",
+          createdAt: "2026-02-23T00:00:05.000Z",
+          label: "Ran tests",
+          tone: "tool",
+        },
+      ],
+      [
+        {
+          taskId: "wf-1",
+          isWorkflow: true,
+          name: "audit",
+          taskType: "local_workflow",
+          description: "Audit the module",
+          status: "running",
+          reconciled: false,
+          error: null,
+          summary: null,
+          startedAt: "2026-02-23T00:00:01.000Z",
+          updatedAt: "2026-02-23T00:00:04.000Z",
+          completedAt: null,
+          phases: [],
+          agents: [],
+          activeAgentCount: 0,
+          totalTokens: null,
+          toolUses: null,
+          turnId: null,
+          anchorActivityId: "activity-1",
+        },
+      ],
+    );
+
+    expect(entries.map((entry) => entry.kind)).toEqual(["workflow", "work"]);
+    expect(entries[0]).toMatchObject({
+      id: "workflow:wf-1",
+      createdAt: "2026-02-23T00:00:01.000Z",
     });
   });
 });

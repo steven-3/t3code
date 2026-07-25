@@ -61,6 +61,8 @@ import {
 import { Button } from "../ui/button";
 import { buildExpandedImagePreview, ExpandedImagePreview } from "./ExpandedImagePreview";
 import { ProposedPlanCard } from "./ProposedPlanCard";
+import { WorkflowRunCard } from "./WorkflowRunCard";
+import { useTickingNow } from "~/hooks/useTickingNow";
 import { ChangedFilesCard } from "./ChangedFilesTree";
 import { shouldAutoExpandChangedFiles } from "./changedFilesPresentation";
 import { MessageCopyButton } from "./MessageCopyButton";
@@ -861,6 +863,7 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
         <AssistantTimelineRow row={row} />
       ) : null}
       {row.kind === "proposed-plan" ? <ProposedPlanTimelineRow row={row} /> : null}
+      {row.kind === "workflow" ? <WorkflowTimelineRow row={row} /> : null}
       {row.kind === "working" ? <WorkingTimelineRow row={row} /> : null}
     </div>
   );
@@ -1087,6 +1090,16 @@ function ProposedPlanTimelineRow({
         cwd={ctx.markdownCwd}
         workspaceRoot={ctx.workspaceRoot}
       />
+    </div>
+  );
+}
+
+function WorkflowTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "workflow" }> }) {
+  const now = useTickingNow(row.run.status === "running");
+
+  return (
+    <div className="min-w-0 px-1 py-0.5">
+      <WorkflowRunCard run={row.run} now={now} />
     </div>
   );
 }
