@@ -362,6 +362,7 @@ jobs:
           run-install: true
 
       - name: Download relay client tracing config
+        continue-on-error: true
         uses: actions/download-artifact@v8
         with:
           name: relay-client-tracing-config
@@ -371,6 +372,10 @@ jobs:
         shell: bash
         run: |
           config_path="$RUNNER_TEMP/relay-client-tracing/relay-client-tracing.env"
+          if [ ! -f "$config_path" ]; then
+            echo "No relay client tracing config; building without relay tracing."
+            exit 0
+          fi
           tracing_token="$(sed -n 's/^T3CODE_RELAY_CLIENT_OTLP_TRACES_TOKEN=//p' "$config_path")"
           echo "::add-mask::$tracing_token"
           cat "$config_path" >> "$GITHUB_ENV"
@@ -639,6 +644,7 @@ jobs:
               - --filter=@t3tools/scripts...
 
       - name: Download relay client tracing config
+        continue-on-error: true
         uses: actions/download-artifact@v8
         with:
           name: relay-client-tracing-config
@@ -648,6 +654,10 @@ jobs:
         shell: bash
         run: |
           config_path="$RUNNER_TEMP/relay-client-tracing/relay-client-tracing.env"
+          if [ ! -f "$config_path" ]; then
+            echo "No relay client tracing config; building without relay tracing."
+            exit 0
+          fi
           tracing_token="$(sed -n 's/^T3CODE_RELAY_CLIENT_OTLP_TRACES_TOKEN=//p' "$config_path")"
           echo "::add-mask::$tracing_token"
           cat "$config_path" >> "$GITHUB_ENV"
@@ -809,6 +819,7 @@ jobs:
               - --filter=@t3tools/web...
 
       - name: Download relay client tracing config
+        continue-on-error: true
         uses: actions/download-artifact@v8
         with:
           name: relay-client-tracing-config
@@ -818,6 +829,10 @@ jobs:
         shell: bash
         run: |
           config_path="$RUNNER_TEMP/relay-client-tracing/relay-client-tracing.env"
+          if [ ! -f "$config_path" ]; then
+            echo "No relay client tracing config; building without relay tracing."
+            exit 0
+          fi
           tracing_token="$(sed -n 's/^T3CODE_RELAY_CLIENT_OTLP_TRACES_TOKEN=//p' "$config_path")"
           echo "::add-mask::$tracing_token"
           cat "$config_path" >> "$GITHUB_ENV"
