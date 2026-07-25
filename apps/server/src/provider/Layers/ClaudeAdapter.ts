@@ -101,6 +101,13 @@ type ClaudeToolResultStreamKind = Extract<
 >;
 type ClaudeSdkEffort = NonNullable<ClaudeQueryOptions["effort"]>;
 
+/**
+ * Effort levels the CLI's `Settings.effortLevel` can express, and therefore
+ * the only ones applicable to a running session. `max` is absent from that
+ * type, so moving to or from it still costs a session restart.
+ */
+const CLAUDE_FLAG_SETTABLE_EFFORT_LEVELS = new Set<string>(["low", "medium", "high", "xhigh"]);
+
 function encodeJsonStringForDiagnostics(input: unknown): string | undefined {
   const result = encodeUnknownJsonStringExit(input);
   return Exit.isSuccess(result) ? result.value : undefined;
@@ -178,6 +185,29 @@ interface ClaudeTaskState {
   readonly blockedBy: Set<string>;
 }
 
+/**
+ * A provider-side background run (shell task, subagent, or dynamic workflow).
+ *
+ * Only `task_started` carries the run's identity (`task_type`,
+ * `workflow_name`, `subagent_type`, launching `tool_use_id`); every later
+ * frame identifies the run by id alone, so the identity is cached here and
+ * re-attached to progress/terminal events. The registry is also the source
+ * for the session-exit sweep: a run still open when the session dies would
+ * otherwise stay "running" in clients forever.
+ */
+interface BackgroundTaskState {
+  readonly taskId: string;
+  readonly startedAt: string;
+  description: string | undefined;
+  taskType: string | undefined;
+  workflowName: string | undefined;
+  subagentType: string | undefined;
+  toolUseId: string | undefined;
+  settled: boolean;
+  /** Latest cumulative token total the provider reported for this run. */
+  processedTokens: number;
+}
+
 interface ClaudeSessionContext {
   session: ProviderSession;
   readonly promptQueue: Queue.Queue<PromptQueueItem>;
@@ -186,6 +216,7 @@ interface ClaudeSessionContext {
   readonly startedAt: string;
   readonly basePermissionMode: PermissionMode | undefined;
   currentApiModelId: string | undefined;
+  currentSelectionConfig: ClaudeSelectionRuntimeConfig | undefined;
   resumeSessionId: string | undefined;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>;
@@ -195,6 +226,7 @@ interface ClaudeSessionContext {
   }>;
   readonly inFlightTools: Map<number, ToolInFlight>;
   readonly claudeTasks: Map<string, ClaudeTaskState>;
+  readonly backgroundTasks: Map<string, BackgroundTaskState>;
   turnState: ClaudeTurnState | undefined;
   lastKnownContextWindow: number | undefined;
   lastKnownTokenUsage: ThreadTokenUsageSnapshot | undefined;
@@ -207,6 +239,12 @@ interface ClaudeSessionContext {
 interface ClaudeQueryRuntime extends AsyncIterable<SDKMessage> {
   readonly interrupt: () => Promise<void>;
   readonly setModel: (model?: string) => Promise<void>;
+  /**
+   * Merge settings into the live session's flag layer. Optional: older SDK
+   * builds and test doubles may not provide it, and the caller degrades to
+   * leaving the option unchanged rather than failing the turn.
+   */
+  readonly applyFlagSettings?: (settings: Record<string, unknown>) => Promise<void>;
   readonly setPermissionMode: (mode: PermissionMode) => Promise<void>;
   readonly setMaxThinkingTokens: (maxThinkingTokens: number | null) => Promise<void>;
   readonly getContextUsage?: () => Promise<SDKControlGetContextUsageResponse>;
@@ -275,6 +313,95 @@ function getEffectiveClaudeAgentEffort(
 ): ClaudeSdkEffort | null {
   const normalized = normalizeClaudeCliEffort(effort, model);
   return normalized ? (normalized as ClaudeSdkEffort) : null;
+}
+
+/** Why a session is being torn down, which changes how its runs are reported. */
+type ClaudeSessionStopReason = "session-stopped" | "session-replaced";
+
+interface ClaudeSelectionRuntimeConfig {
+  readonly apiModelId: string | undefined;
+  readonly effectiveEffort: ClaudeSdkEffort | null;
+  readonly settings: {
+    alwaysThinkingEnabled?: boolean;
+    fastMode?: boolean;
+    ultracode?: boolean;
+  };
+}
+
+/**
+ * Everything a model selection contributes to the CLI's runtime configuration.
+ *
+ * Shared by session start (where it becomes `query()` options) and turn send
+ * (where the delta is applied to the live session instead), so both paths read
+ * one selection the same way.
+ */
+function resolveClaudeSelectionRuntimeConfig(
+  modelSelection: ModelSelection | undefined,
+): ClaudeSelectionRuntimeConfig {
+  const caps = getClaudeModelCapabilities(modelSelection?.model);
+  const descriptors = getProviderOptionDescriptors({ caps });
+  const rawEffort = getModelSelectionStringOptionValue(modelSelection, "effort");
+  const effort = resolveClaudeEffort(caps, rawEffort) ?? null;
+  const fastModeSupported = descriptors.some(
+    (descriptor) => descriptor.type === "boolean" && descriptor.id === "fastMode",
+  );
+  const thinkingSupported = descriptors.some(
+    (descriptor) => descriptor.type === "boolean" && descriptor.id === "thinking",
+  );
+  const fastMode =
+    getModelSelectionBooleanOptionValue(modelSelection, "fastMode") === true && fastModeSupported;
+  const thinking = thinkingSupported
+    ? getModelSelectionBooleanOptionValue(modelSelection, "thinking")
+    : undefined;
+
+  return {
+    apiModelId: modelSelection ? resolveClaudeApiModelId(modelSelection) : undefined,
+    effectiveEffort: getEffectiveClaudeAgentEffort(effort, modelSelection?.model),
+    settings: {
+      ...(typeof thinking === "boolean" ? { alwaysThinkingEnabled: thinking } : {}),
+      ...(fastMode ? { fastMode: true } : {}),
+      ...(isClaudeUltracodeEffort(effort) ? { ultracode: true } : {}),
+    },
+  };
+}
+
+/**
+ * Flag-settings patch that moves a live session from one selection to another,
+ * or `undefined` when nothing changed.
+ *
+ * Only keys the CLI can merge mid-session appear here. `effortLevel` carries
+ * the SDK's `Settings` value space, which has no `max` — a move to or from
+ * `max` is filtered out and left to the reactor, which restarts the session
+ * for it (see `claudeSelectionChangeRequiresSessionRestart`).
+ */
+function claudeFlagSettingsPatch(
+  previous: ClaudeSelectionRuntimeConfig | undefined,
+  next: ClaudeSelectionRuntimeConfig,
+): Record<string, unknown> | undefined {
+  if (!previous) {
+    return undefined;
+  }
+
+  const patch: Record<string, unknown> = {};
+  if (
+    previous.effectiveEffort !== next.effectiveEffort &&
+    next.effectiveEffort !== null &&
+    CLAUDE_FLAG_SETTABLE_EFFORT_LEVELS.has(next.effectiveEffort)
+  ) {
+    patch.effortLevel = next.effectiveEffort;
+  }
+
+  // Booleans must be sent explicitly when switched off: the SDK drops
+  // `undefined` keys, so omitting one would leave the old value in place.
+  for (const key of ["alwaysThinkingEnabled", "fastMode", "ultracode"] as const) {
+    const previousValue = previous.settings[key] ?? false;
+    const nextValue = next.settings[key] ?? false;
+    if (previousValue !== nextValue) {
+      patch[key] = nextValue;
+    }
+  }
+
+  return Object.keys(patch).length > 0 ? patch : undefined;
 }
 
 function isClaudeInterruptedMessage(message: string): boolean {
@@ -507,44 +634,127 @@ function compactBoundaryTokenUsageSnapshot(
   });
 }
 
-function normalizeClaudeTaskProgressTokenUsage(
+/**
+ * Fold a background run's token report into the thread snapshot.
+ *
+ * Background runs (subagents, dynamic workflows, backgrounded shell tasks)
+ * each own a separate context window; their totals say nothing about how full
+ * the main thread's window is. Treating those totals as active tokens pinned
+ * the context meter to 100% for the rest of the session — a 23-agent workflow
+ * burning 3.4M tokens read as a full 1M main-thread window while the thread
+ * itself held ~110k.
+ *
+ * So the active side of the snapshot is copied verbatim from the last
+ * authoritative main-thread reading, and only the cumulative
+ * `totalProcessedTokens` counter grows with background work. With no
+ * main-thread reading yet there is nothing truthful to report, so nothing is
+ * emitted.
+ */
+function backgroundTaskTokenUsageSnapshot(
   value: unknown,
   context: ClaudeSessionContext,
+  task: BackgroundTaskState | undefined,
 ): ThreadTokenUsageSnapshot | undefined {
   const totalTokens = claudeTotalProcessedTokens(value);
   if (totalTokens === undefined || totalTokens <= 0) {
     return undefined;
   }
 
-  const lastUsedTokens = context.lastKnownTokenUsage?.usedTokens;
-  const activeTokens =
-    lastUsedTokens !== undefined ? Math.max(totalTokens, lastUsedTokens) : totalTokens;
-  if (lastUsedTokens !== undefined && activeTokens === lastUsedTokens) {
+  if (task) {
+    // Reports are cumulative per run, so only the growth is new information.
+    if (totalTokens <= task.processedTokens) {
+      return undefined;
+    }
+    task.processedTokens = totalTokens;
+  }
+
+  const base = context.lastKnownTokenUsage;
+  if (!base) {
     return undefined;
   }
+
+  const backgroundTokens = task
+    ? sumBackgroundProcessedTokens(context)
+    : Math.max(totalTokens, sumBackgroundProcessedTokens(context));
+  const mainTotalProcessedTokens = context.lastKnownTotalProcessedTokens ?? base.usedTokens;
+  const totalProcessedTokens = mainTotalProcessedTokens + backgroundTokens;
 
   const usage = value as Record<string, unknown>;
-  const snapshot = makeClaudeTokenUsageSnapshot({
-    activeTokens,
-    ...(context.lastKnownContextWindow !== undefined
-      ? { contextWindow: context.lastKnownContextWindow }
-      : {}),
-    totalProcessedTokens: Math.max(
-      totalTokens,
-      context.lastKnownTotalProcessedTokens ?? totalTokens,
-    ),
-  });
-  if (!snapshot) {
-    return undefined;
-  }
-
   const toolUses = finiteNonNegativeInteger(usage.tool_uses);
   const durationMs = finiteNonNegativeInteger(usage.duration_ms);
   return {
-    ...snapshot,
+    ...base,
+    ...(totalProcessedTokens > base.usedTokens ? { totalProcessedTokens } : {}),
     ...(toolUses !== undefined ? { toolUses } : {}),
     ...(durationMs !== undefined ? { durationMs } : {}),
   };
+}
+
+function registerBackgroundTask(
+  context: ClaudeSessionContext,
+  input: {
+    readonly taskId: string;
+    readonly createdAt: string;
+    readonly description?: string | undefined;
+    readonly taskType?: string | undefined;
+    readonly workflowName?: string | undefined;
+    readonly subagentType?: string | undefined;
+    readonly toolUseId?: string | undefined;
+  },
+): BackgroundTaskState {
+  const existing = context.backgroundTasks.get(input.taskId);
+  const task: BackgroundTaskState = existing ?? {
+    taskId: input.taskId,
+    startedAt: input.createdAt,
+    description: undefined,
+    taskType: undefined,
+    workflowName: undefined,
+    subagentType: undefined,
+    toolUseId: undefined,
+    settled: false,
+    processedTokens: 0,
+  };
+
+  task.description = input.description ?? task.description;
+  task.taskType = input.taskType ?? task.taskType;
+  task.workflowName = input.workflowName ?? task.workflowName;
+  task.subagentType = input.subagentType ?? task.subagentType;
+  task.toolUseId = input.toolUseId ?? task.toolUseId;
+  task.settled = false;
+  context.backgroundTasks.set(input.taskId, task);
+  return task;
+}
+
+function backgroundTaskIdentityPayload(
+  task: BackgroundTaskState | undefined,
+  options?: { readonly identityOnly?: boolean },
+): {
+  taskType?: string;
+  workflowName?: string;
+  subagentType?: string;
+  toolUseId?: string;
+} {
+  if (!task) {
+    return {};
+  }
+  return {
+    ...(task.taskType ? { taskType: task.taskType } : {}),
+    ...(task.workflowName ? { workflowName: task.workflowName } : {}),
+    ...(options?.identityOnly
+      ? {}
+      : {
+          ...(task.subagentType ? { subagentType: task.subagentType } : {}),
+          ...(task.toolUseId ? { toolUseId: task.toolUseId } : {}),
+        }),
+  };
+}
+
+function sumBackgroundProcessedTokens(context: ClaudeSessionContext): number {
+  let total = 0;
+  for (const task of context.backgroundTasks.values()) {
+    total += task.processedTokens;
+  }
+  return total;
 }
 
 function asCanonicalTurnId(value: TurnId): TurnId {
@@ -1735,6 +1945,12 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     options?: {
       readonly rawMethod?: string;
       readonly rawPayload?: unknown;
+      /**
+       * Background-run emissions carry a total that already includes every
+       * background run, so they must not become the main thread's cumulative
+       * baseline — folding them back in would compound on the next report.
+       */
+      readonly backgroundOrigin?: boolean;
     },
   ) {
     if (!usage) {
@@ -1742,8 +1958,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     }
 
     context.lastKnownTokenUsage = usage;
-    context.lastKnownTotalProcessedTokens =
-      usage.totalProcessedTokens ?? context.lastKnownTotalProcessedTokens;
+    if (!options?.backgroundOrigin) {
+      context.lastKnownTotalProcessedTokens =
+        usage.totalProcessedTokens ?? context.lastKnownTotalProcessedTokens;
+    }
 
     const turnState = context.turnState;
     const stamp = yield* makeEventStamp();
@@ -2676,24 +2894,36 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           },
         });
         return;
-      case "task_started":
+      case "task_started": {
+        const task = registerBackgroundTask(context, {
+          taskId: message.task_id,
+          createdAt: stamp.createdAt,
+          description: message.description,
+          taskType: message.task_type,
+          workflowName: message.workflow_name,
+          subagentType: message.subagent_type,
+          toolUseId: message.tool_use_id,
+        });
         yield* offerRuntimeEvent({
           ...base,
           type: "task.started",
           payload: {
             taskId: RuntimeTaskId.make(message.task_id),
             description: message.description,
-            ...(message.task_type ? { taskType: message.task_type } : {}),
+            ...backgroundTaskIdentityPayload(task),
           },
         });
         return;
-      case "task_progress":
+      }
+      case "task_progress": {
+        const task = context.backgroundTasks.get(message.task_id);
         yield* emitThreadTokenUsage(
           context,
-          normalizeClaudeTaskProgressTokenUsage(message.usage, context),
+          backgroundTaskTokenUsageSnapshot(message.usage, context, task),
           {
             rawMethod: "claude/system/task_progress",
             rawPayload: message,
+            backgroundOrigin: true,
           },
         );
         yield* offerRuntimeEvent({
@@ -2705,23 +2935,57 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
             ...(message.summary ? { summary: message.summary } : {}),
             ...(message.usage ? { usage: message.usage } : {}),
             ...(message.last_tool_name ? { lastToolName: message.last_tool_name } : {}),
+            ...backgroundTaskIdentityPayload(task),
+            ...(message.subagent_type ? { subagentType: message.subagent_type } : {}),
+            ...(message.tool_use_id ? { toolUseId: message.tool_use_id } : {}),
           },
         });
         return;
-      // Task state patch (status/backgrounded/end_time). No runtime mapping
-      // yet — the terminal task_notification reports the outcome — but it
-      // must not surface as an unknown-subtype warning row.
-      case "task_updated":
+      }
+      // Task state patch (status/backgrounded/error). The terminal
+      // task_notification still reports the outcome, but a run that dies
+      // without one (killed from another surface, host process gone) leaves
+      // clients spinning unless the patch is forwarded.
+      case "task_updated": {
+        const task = context.backgroundTasks.get(message.task_id);
+        const patch = message.patch;
+        if (task && patch.description) {
+          task.description = patch.description;
+        }
+        const status = patch.status;
+        if (task && (status === "completed" || status === "failed" || status === "killed")) {
+          task.settled = true;
+        }
+        yield* offerRuntimeEvent({
+          ...base,
+          type: "task.updated",
+          payload: {
+            taskId: RuntimeTaskId.make(message.task_id),
+            ...(status ? { status } : {}),
+            ...(patch.description ? { description: patch.description } : {}),
+            ...(patch.error ? { error: patch.error } : {}),
+            ...(typeof patch.is_backgrounded === "boolean"
+              ? { backgrounded: patch.is_backgrounded }
+              : {}),
+            ...backgroundTaskIdentityPayload(task, { identityOnly: true }),
+          },
+        });
         return;
-      case "task_notification":
+      }
+      case "task_notification": {
+        const task = context.backgroundTasks.get(message.task_id);
         yield* emitThreadTokenUsage(
           context,
-          normalizeClaudeTaskProgressTokenUsage(message.usage, context),
+          backgroundTaskTokenUsageSnapshot(message.usage, context, task),
           {
             rawMethod: "claude/system/task_notification",
             rawPayload: message,
+            backgroundOrigin: true,
           },
         );
+        if (task) {
+          task.settled = true;
+        }
         yield* offerRuntimeEvent({
           ...base,
           type: "task.completed",
@@ -2730,9 +2994,12 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
             status: message.status,
             ...(message.summary ? { summary: message.summary } : {}),
             ...(message.usage ? { usage: message.usage } : {}),
+            ...backgroundTaskIdentityPayload(task),
+            ...(message.tool_use_id ? { toolUseId: message.tool_use_id } : {}),
           },
         });
         return;
+      }
       case "files_persisted":
         yield* offerRuntimeEvent({
           ...base,
@@ -3024,13 +3291,86 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     });
   });
 
+  /**
+   * Close out background runs the provider never reported a terminal state
+   * for. The CLI only emits `task_notification` while it is alive, so a run
+   * still going when the session dies (interrupt, crashed runtime, stopped
+   * session) leaves clients with a workflow that spins forever. Synthesizing
+   * the terminal event keeps the roster honest; `reconciled` marks it as
+   * locally inferred rather than provider-reported.
+   */
+  const reconcileUnsettledBackgroundTasks = Effect.fn("reconcileUnsettledBackgroundTasks")(
+    function* (context: ClaudeSessionContext, reason: ClaudeSessionStopReason) {
+      const ended =
+        reason === "session-replaced"
+          ? "when the provider session restarted"
+          : "when the session ended";
+      const stoppedNames: Array<string> = [];
+
+      for (const task of context.backgroundTasks.values()) {
+        if (task.settled) {
+          continue;
+        }
+        task.settled = true;
+        stoppedNames.push(task.workflowName ?? task.description ?? task.taskId);
+
+        const stamp = yield* makeEventStamp();
+        yield* offerRuntimeEvent({
+          type: "task.completed",
+          eventId: stamp.eventId,
+          provider: PROVIDER,
+          createdAt: stamp.createdAt,
+          threadId: context.session.threadId,
+          ...(context.turnState ? { turnId: asCanonicalTurnId(context.turnState.turnId) } : {}),
+          payload: {
+            taskId: RuntimeTaskId.make(task.taskId),
+            status: "stopped",
+            reconciled: true,
+            summary: task.workflowName
+              ? `Workflow "${task.workflowName}" stopped ${ended}.`
+              : `Background task stopped ${ended}.`,
+            ...backgroundTaskIdentityPayload(task),
+          },
+          providerRefs: nativeProviderRefs(context),
+          raw: {
+            source: "claude.sdk.message",
+            method: "t3/background-task/reconciled",
+            payload: {
+              taskId: task.taskId,
+              reason,
+              ...(task.taskType ? { taskType: task.taskType } : {}),
+              ...(task.workflowName ? { workflowName: task.workflowName } : {}),
+            },
+          },
+        });
+      }
+
+      // A restart is something T3 chose to do, so losing work to it warrants
+      // saying so out loud rather than only marking the runs stopped.
+      if (reason === "session-replaced" && stoppedNames.length > 0) {
+        yield* emitRuntimeWarning(
+          context,
+          `Restarting the Claude session stopped ${stoppedNames.length} background run${
+            stoppedNames.length === 1 ? "" : "s"
+          }: ${stoppedNames.join(", ")}.`,
+          { reason, tasks: stoppedNames },
+        );
+      }
+    },
+  );
+
   const stopSessionInternal = Effect.fn("stopSessionInternal")(function* (
     context: ClaudeSessionContext,
-    options?: { readonly emitExitEvent?: boolean },
+    options?: {
+      readonly emitExitEvent?: boolean;
+      readonly reason?: ClaudeSessionStopReason;
+    },
   ) {
     if (context.stopped) return;
 
     context.stopped = true;
+
+    yield* reconcileUnsettledBackgroundTasks(context, options?.reason ?? "session-stopped");
 
     for (const [requestId, pending] of context.pendingApprovals) {
       yield* Deferred.succeed(pending.decision, "cancel");
@@ -3153,6 +3493,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         });
         yield* stopSessionInternal(existingContext, {
           emitExitEvent: false,
+          reason: "session-replaced",
         }).pipe(
           // Replacement cleanup is best-effort: never block the new session on
           // either typed failures or unexpected defects from tearing down the old one.
@@ -3190,6 +3531,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const pendingUserInputs = new Map<ApprovalRequestId, PendingUserInput>();
       const inFlightTools = new Map<number, ToolInFlight>();
       const claudeTasks = new Map<string, ClaudeTaskState>();
+      const backgroundTasks = new Map<string, BackgroundTaskState>();
 
       const contextRef = yield* Ref.make<ClaudeSessionContext | undefined>(undefined);
 
@@ -3487,37 +3829,17 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const extraArgs = parseCliArgs(claudeSettings.launchArgs).flags;
       const modelSelection =
         input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
-      const caps = getClaudeModelCapabilities(modelSelection?.model);
-      const descriptors = getProviderOptionDescriptors({ caps });
-      const apiModelId = modelSelection ? resolveClaudeApiModelId(modelSelection) : undefined;
       const initialContextWindow = selectedClaudeContextWindow(modelSelection);
-      const rawEffort = getModelSelectionStringOptionValue(modelSelection, "effort");
-      const effort = resolveClaudeEffort(caps, rawEffort) ?? null;
-      const fastModeSupported = descriptors.some(
-        (descriptor) => descriptor.type === "boolean" && descriptor.id === "fastMode",
-      );
-      const thinkingSupported = descriptors.some(
-        (descriptor) => descriptor.type === "boolean" && descriptor.id === "thinking",
-      );
-      const fastMode =
-        getModelSelectionBooleanOptionValue(modelSelection, "fastMode") === true &&
-        fastModeSupported;
-      const thinking = thinkingSupported
-        ? getModelSelectionBooleanOptionValue(modelSelection, "thinking")
-        : undefined;
-      const ultracode = isClaudeUltracodeEffort(effort);
-      const effectiveEffort = getEffectiveClaudeAgentEffort(effort, modelSelection?.model);
+      const selectionConfig = resolveClaudeSelectionRuntimeConfig(modelSelection);
+      const apiModelId = selectionConfig.apiModelId;
+      const effectiveEffort = selectionConfig.effectiveEffort;
       const runtimeModeToPermission: Record<string, PermissionMode> = {
         "auto-accept-edits": "acceptEdits",
         auto: "auto",
         "full-access": "bypassPermissions",
       };
       const permissionMode = runtimeModeToPermission[input.runtimeMode];
-      const settings = {
-        ...(typeof thinking === "boolean" ? { alwaysThinkingEnabled: thinking } : {}),
-        ...(fastMode ? { fastMode: true } : {}),
-        ...(ultracode ? { ultracode: true } : {}),
-      };
+      const settings = selectionConfig.settings;
       const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
       const queryOptions: ClaudeQueryOptions = {
         ...(input.cwd ? { cwd: input.cwd } : {}),
@@ -3626,12 +3948,14 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         startedAt,
         basePermissionMode: permissionMode,
         currentApiModelId: apiModelId,
+        currentSelectionConfig: selectionConfig,
         resumeSessionId: sessionId,
         pendingApprovals,
         pendingUserInputs,
         turns: [],
         inFlightTools,
         claudeTasks,
+        backgroundTasks,
         turnState: undefined,
         lastKnownContextWindow: initialContextWindow,
         lastKnownTokenUsage: undefined,
@@ -3667,7 +3991,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
             ...(input.cwd ? { cwd: input.cwd } : {}),
             ...(effectiveEffort ? { effort: effectiveEffort } : {}),
             ...(permissionMode ? { permissionMode } : {}),
-            ...(fastMode ? { fastMode: true } : {}),
+            ...(selectionConfig.settings.fastMode ? { fastMode: true } : {}),
           },
         },
         providerRefs: {},
@@ -3748,6 +4072,42 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...context.session,
         model: modelSelection.model,
       };
+    }
+
+    // Option changes (effort, ultracode, fast mode, thinking) are applied to
+    // the running session rather than by restarting it. The CLI process hosts
+    // Claude's background runs — a dynamic workflow and every agent it spawns
+    // live inside it — so a restart to change a flag silently kills work in
+    // flight. Changes the flag layer cannot express still restart upstream;
+    // see `claudeSelectionChangeRequiresSessionRestart`.
+    if (modelSelection) {
+      const nextSelectionConfig = resolveClaudeSelectionRuntimeConfig(modelSelection);
+      const patch = claudeFlagSettingsPatch(context.currentSelectionConfig, nextSelectionConfig);
+      const applyFlagSettings = context.query.applyFlagSettings;
+      if (!patch) {
+        context.currentSelectionConfig = nextSelectionConfig;
+      } else {
+        const applied = applyFlagSettings
+          ? yield* Effect.tryPromise({
+              try: () => applyFlagSettings(patch),
+              catch: (cause) => toRequestError(input.threadId, "turn/applyFlagSettings", cause),
+            }).pipe(
+              Effect.as(true),
+              Effect.catchCause(() => Effect.succeed(false)),
+            )
+          : false;
+        if (applied) {
+          context.currentSelectionConfig = nextSelectionConfig;
+        } else {
+          // The cached config stays put: the session is still running with the
+          // old options, and claiming otherwise would suppress the next retry.
+          yield* emitRuntimeWarning(
+            context,
+            `Claude could not apply updated model options to the running session (${Object.keys(patch).join(", ")}).`,
+            { patch },
+          );
+        }
+      }
     }
 
     // Apply interaction mode by switching the SDK's permission mode.

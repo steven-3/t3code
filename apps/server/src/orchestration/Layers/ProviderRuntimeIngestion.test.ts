@@ -3071,6 +3071,77 @@ describe("ProviderRuntimeIngestion", () => {
     expect(activity?.tone).toBe("info");
   });
 
+  it("projects workflow identity and terminal state patches into thread activities", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    harness.emit({
+      type: "task.started",
+      eventId: asEventId("evt-workflow-started"),
+      provider: ProviderDriverKind.make("claudeAgent"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-workflow-1"),
+      payload: {
+        taskId: "wf-1",
+        taskType: "local_workflow",
+        workflowName: "review-changes",
+        toolUseId: "toolu_1",
+        description: "Review the diff",
+      },
+    });
+
+    // Bookkeeping-only patches stay out of the log; a terminal one does not.
+    harness.emit({
+      type: "task.updated",
+      eventId: asEventId("evt-workflow-noise"),
+      provider: ProviderDriverKind.make("claudeAgent"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-workflow-1"),
+      payload: { taskId: "wf-1", backgrounded: true },
+    });
+
+    harness.emit({
+      type: "task.updated",
+      eventId: asEventId("evt-workflow-killed"),
+      provider: ProviderDriverKind.make("claudeAgent"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("turn-workflow-1"),
+      payload: { taskId: "wf-1", status: "killed", workflowName: "review-changes" },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      entry.activities.some(
+        (activity: ProviderRuntimeTestActivity) => activity.id === "evt-workflow-killed",
+      ),
+    );
+
+    const started = thread.activities.find(
+      (activity: ProviderRuntimeTestActivity) => activity.id === "evt-workflow-started",
+    );
+    const startedPayload =
+      started?.payload && typeof started.payload === "object"
+        ? (started.payload as Record<string, unknown>)
+        : undefined;
+    expect(started?.summary).toBe("Workflow review-changes started");
+    expect(startedPayload?.workflowName).toBe("review-changes");
+    expect(startedPayload?.toolUseId).toBe("toolu_1");
+
+    const killed = thread.activities.find(
+      (activity: ProviderRuntimeTestActivity) => activity.id === "evt-workflow-killed",
+    );
+    expect(killed?.kind).toBe("task.updated");
+    expect(killed?.summary).toBe("Task stopped");
+
+    expect(
+      thread.activities.some(
+        (activity: ProviderRuntimeTestActivity) => activity.id === "evt-workflow-noise",
+      ),
+    ).toBe(false);
+  });
+
   it("projects Codex task lifecycle chunks into thread activities", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

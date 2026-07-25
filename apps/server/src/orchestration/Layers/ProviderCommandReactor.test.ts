@@ -1316,11 +1316,11 @@ describe("ProviderCommandReactor", () => {
     });
   });
 
-  it("restarts claude sessions when claude effort changes", async () => {
+  it("restarts claude sessions when the effort change cannot be applied in-session", async () => {
     const harness = await createHarness({
       threadModelSelection: {
         instanceId: ProviderInstanceId.make("claudeAgent"),
-        model: "claude-sonnet-4-6",
+        model: "claude-opus-5",
       },
     });
     const now = "2026-01-01T00:00:00.000Z";
@@ -1338,7 +1338,7 @@ describe("ProviderCommandReactor", () => {
         },
         modelSelection: createModelSelection(
           ProviderInstanceId.make("claudeAgent"),
-          "claude-sonnet-4-6",
+          "claude-opus-5",
           [{ id: "effort", value: "medium" }],
         ),
         interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
@@ -1363,7 +1363,7 @@ describe("ProviderCommandReactor", () => {
         },
         modelSelection: createModelSelection(
           ProviderInstanceId.make("claudeAgent"),
-          "claude-sonnet-4-6",
+          "claude-opus-5",
           [{ id: "effort", value: "max" }],
         ),
         interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
@@ -1378,11 +1378,83 @@ describe("ProviderCommandReactor", () => {
       resumeCursor: { opaque: "resume-1" },
       modelSelection: createModelSelection(
         ProviderInstanceId.make("claudeAgent"),
-        "claude-sonnet-4-6",
+        "claude-opus-5",
         [{ id: "effort", value: "max" }],
       ),
     });
   });
+
+  // Claude's background runs — a dynamic workflow and every agent it spawns —
+  // live inside the CLI process, so a restart to change an option throws that
+  // work away. Effort moves the flag layer can express must not restart.
+  effectIt.effect("keeps the claude session alive when the effort change applies in-session", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          threadModelSelection: {
+            instanceId: ProviderInstanceId.make("claudeAgent"),
+            model: "claude-opus-5",
+          },
+        }),
+      );
+      const now = "2026-01-01T00:00:00.000Z";
+
+      yield* harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-claude-in-session-1"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-claude-in-session-1"),
+          role: "user",
+          text: "first claude turn",
+          attachments: [],
+        },
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("claudeAgent"),
+          "claude-opus-5",
+          [{ id: "effort", value: "medium" }],
+        ),
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      });
+
+      yield* Effect.promise(() => waitFor(() => harness.startSession.mock.calls.length === 1));
+      yield* Effect.promise(() => waitFor(() => harness.sendTurn.mock.calls.length === 1));
+
+      yield* harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-claude-in-session-2"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-claude-in-session-2"),
+          role: "user",
+          text: "second claude turn",
+          attachments: [],
+        },
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("claudeAgent"),
+          "claude-opus-5",
+          [{ id: "effort", value: "high" }],
+        ),
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      });
+
+      yield* Effect.promise(() => waitFor(() => harness.sendTurn.mock.calls.length === 2));
+      expect(harness.startSession.mock.calls.length).toBe(1);
+      // The new selection still reaches the adapter — it is applied to the live
+      // session instead of being baked into a replacement process.
+      expect(harness.sendTurn.mock.calls[1]?.[0]).toMatchObject({
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("claudeAgent"),
+          "claude-opus-5",
+          [{ id: "effort", value: "high" }],
+        ),
+      });
+    }),
+  );
 
   it("restarts the provider session when runtime mode is updated on the thread", async () => {
     const harness = await createHarness();

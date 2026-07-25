@@ -425,6 +425,45 @@ export function isClaudeUltracodeEffort(effort: string | null | undefined): bool
   return effort === "ultracode";
 }
 
+/**
+ * Whether moving between two Claude model selections forces a session restart.
+ *
+ * Restarting is expensive in a way that is easy to miss: Claude's background
+ * runs — a dynamic workflow and every agent it spawns — live inside the CLI
+ * process, so replacing that process throws away work in flight. Most option
+ * changes are applied to the live session instead (`query.applyFlagSettings`
+ * for effort/ultracode/fast mode/thinking, `query.setModel` for the model), so
+ * this returns `true` only for changes that layer genuinely cannot express.
+ *
+ * The one such change today is `max` effort: the SDK's `Settings.effortLevel`
+ * is typed `'low' | 'medium' | 'high' | 'xhigh'`, with no `max`, so entering or
+ * leaving `max` has to be baked in at spawn.
+ */
+export function claudeSelectionChangeRequiresSessionRestart(
+  previous: ModelSelection | undefined,
+  next: ModelSelection | undefined,
+): boolean {
+  if (!previous || !next) {
+    return true;
+  }
+  if (previous.instanceId !== next.instanceId) {
+    return true;
+  }
+
+  const effectiveEffort = (selection: ModelSelection): string | undefined => {
+    const caps = getClaudeModelCapabilities(selection.model);
+    const raw = getModelSelectionStringOptionValue(selection, "effort");
+    return normalizeClaudeCliEffort(resolveClaudeEffort(caps, raw) ?? null, selection.model);
+  };
+
+  const previousEffort = effectiveEffort(previous);
+  const nextEffort = effectiveEffort(next);
+  if (previousEffort === nextEffort) {
+    return false;
+  }
+  return previousEffort === "max" || nextEffort === "max";
+}
+
 export function resolveClaudeContextWindow(
   modelSelection: ModelSelection | undefined,
 ): string | undefined {

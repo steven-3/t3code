@@ -58,6 +58,7 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
   public readonly setModelCalls: Array<string | undefined> = [];
   public readonly setPermissionModeCalls: Array<string> = [];
   public readonly setMaxThinkingTokensCalls: Array<number | null> = [];
+  public readonly applyFlagSettingsCalls: Array<Record<string, unknown>> = [];
   public closeCalls = 0;
 
   emit(message: SDKMessage): void {
@@ -108,6 +109,10 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
 
   readonly setMaxThinkingTokens = async (maxThinkingTokens: number | null): Promise<void> => {
     this.setMaxThinkingTokensCalls.push(maxThinkingTokens);
+  };
+
+  readonly applyFlagSettings = async (settings: Record<string, unknown>): Promise<void> => {
+    this.applyFlagSettingsCalls.push(settings);
   };
 
   readonly close = (): void => {
@@ -431,6 +436,116 @@ describe("ClaudeAdapterLive", () => {
 
       const createInput = harness.getLastCreateQueryInput();
       assert.equal(createInput?.options.effort, "max");
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  // Restarting the session to change an option would kill any background run
+  // hosted by the CLI process, so applicable option changes are merged into
+  // the live session instead.
+  it.effect("applies effort changes to the running session instead of restarting it", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("claudeAgent"),
+          "claude-opus-5",
+          [{ id: "effort", value: "medium" }],
+        ),
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "hello",
+        attachments: [],
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("claudeAgent"),
+          "claude-opus-5",
+          [{ id: "effort", value: "high" }],
+        ),
+      });
+
+      assert.deepEqual(harness.query.applyFlagSettingsCalls, [{ effortLevel: "high" }]);
+      assert.equal(harness.query.closeCalls, 0);
+
+      // Unchanged options produce no further calls.
+      yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "again",
+        attachments: [],
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("claudeAgent"),
+          "claude-opus-5",
+          [{ id: "effort", value: "high" }],
+        ),
+      });
+      assert.equal(harness.query.applyFlagSettingsCalls.length, 1);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("reports background runs stopped by a session replacement", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => runtimeEvents.push(event)),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "wf-replaced",
+        task_type: "local_workflow",
+        workflow_name: "long-running",
+        description: "Fan out across the repo",
+        session_id: "sdk-session-replaced",
+        uuid: "wf-replaced-start",
+      } as unknown as SDKMessage);
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      // Starting a session for a thread that already has one replaces it.
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      const completion = runtimeEvents.find((event) => event.type === "task.completed");
+      assert.equal(completion?.type, "task.completed");
+      if (completion?.type === "task.completed") {
+        assert.equal(completion.payload.status, "stopped");
+        assert.equal(completion.payload.reconciled, true);
+        assert.equal(
+          completion.payload.summary,
+          'Workflow "long-running" stopped when the provider session restarted.',
+        );
+      }
+
+      const warning = runtimeEvents.find(
+        (event) =>
+          event.type === "runtime.warning" && event.payload.message.includes("long-running"),
+      );
+      assert.equal(warning?.type, "runtime.warning");
+      runtimeEventsFiber.interruptUnsafe();
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
@@ -1711,10 +1826,10 @@ describe("ClaudeAdapterLive", () => {
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
 
-      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 6).pipe(
-        Stream.runCollect,
-        Effect.forkChild,
-      );
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => runtimeEvents.push(event)),
+      ).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
         threadId: THREAD_ID,
@@ -1736,8 +1851,9 @@ describe("ClaudeAdapterLive", () => {
         session_id: "sdk-session-task-summary",
         uuid: "task-progress-1",
       } as unknown as SDKMessage);
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
 
-      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
       const progressEvent = runtimeEvents.find((event) => event.type === "task.progress");
       assert.equal(progressEvent?.type, "task.progress");
       if (progressEvent?.type === "task.progress") {
@@ -1747,6 +1863,7 @@ describe("ClaudeAdapterLive", () => {
         );
         assert.equal(progressEvent.payload.description, "Running background teammate");
       }
+      runtimeEventsFiber.interruptUnsafe();
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
@@ -1880,15 +1997,79 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("emits thread token usage updates from Claude task progress", () => {
+  it.effect("never reports background task tokens as main-thread context usage", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => runtimeEvents.push(event)),
+      ).pipe(Effect.forkChild);
 
-      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 6).pipe(
-        Stream.runCollect,
-        Effect.forkChild,
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      // Background runs own separate context windows: a workflow burning
+      // millions of tokens must not move the main thread's meter.
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-usage-1",
+        task_type: "local_workflow",
+        workflow_name: "review-changes",
+        description: "Review the diff",
+        session_id: "sdk-session-task-usage",
+        uuid: "task-usage-start-1",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "system",
+        subtype: "task_progress",
+        task_id: "task-usage-1",
+        description: "Review: verify:bugs",
+        usage: {
+          total_tokens: 3_500_000,
+          tool_uses: 2,
+          duration_ms: 654,
+        },
+        session_id: "sdk-session-task-usage",
+        uuid: "task-usage-progress-1",
+      } as unknown as SDKMessage);
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      // No authoritative main-thread reading exists yet, so there is nothing
+      // truthful to report: the meter stays silent rather than inventing a
+      // used-token count from background work.
+      assert.deepEqual(
+        runtimeEvents.filter((event) => event.type === "thread.token-usage.updated"),
+        [],
       );
+
+      const progressEvent = runtimeEvents.find((event) => event.type === "task.progress");
+      assert.equal(progressEvent?.type, "task.progress");
+      if (progressEvent?.type === "task.progress") {
+        // Identity from task_started is re-attached to progress frames.
+        assert.equal(progressEvent.payload.taskType, "local_workflow");
+        assert.equal(progressEvent.payload.workflowName, "review-changes");
+      }
+      runtimeEventsFiber.interruptUnsafe();
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("surfaces workflow identity and non-terminal task state patches", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => runtimeEvents.push(event)),
+      ).pipe(Effect.forkChild);
 
       yield* adapter.startSession({
         threadId: THREAD_ID,
@@ -1898,36 +2079,208 @@ describe("ClaudeAdapterLive", () => {
 
       harness.query.emit({
         type: "system",
-        subtype: "task_progress",
-        task_id: "task-usage-1",
-        description: "Thinking through the patch",
-        usage: {
-          total_tokens: 321,
-          tool_uses: 2,
-          duration_ms: 654,
-        },
-        session_id: "sdk-session-task-usage",
-        uuid: "task-usage-progress-1",
+        subtype: "task_started",
+        task_id: "wf-1",
+        task_type: "local_workflow",
+        workflow_name: "alvera-app-overhaul",
+        tool_use_id: "toolu_workflow",
+        description: "Build every feature in the spec",
+        session_id: "sdk-session-workflow",
+        uuid: "wf-start",
       } as unknown as SDKMessage);
+      // Killed from another surface: no task_notification follows, so the
+      // patch is the only signal the run is over.
+      harness.query.emit({
+        type: "system",
+        subtype: "task_updated",
+        task_id: "wf-1",
+        patch: { status: "killed" },
+        session_id: "sdk-session-workflow",
+        uuid: "wf-updated",
+      } as unknown as SDKMessage);
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
 
-      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
-      const usageEvent = runtimeEvents.find((event) => event.type === "thread.token-usage.updated");
-      const progressEvent = runtimeEvents.find((event) => event.type === "task.progress");
-      assert.equal(usageEvent?.type, "thread.token-usage.updated");
-      if (usageEvent?.type === "thread.token-usage.updated") {
-        assert.deepEqual(usageEvent.payload, {
-          usage: {
-            usedTokens: 321,
-            lastUsedTokens: 321,
-            toolUses: 2,
-            durationMs: 654,
+      const startedEvent = runtimeEvents.find((event) => event.type === "task.started");
+      assert.equal(startedEvent?.type, "task.started");
+      if (startedEvent?.type === "task.started") {
+        assert.equal(startedEvent.payload.workflowName, "alvera-app-overhaul");
+        assert.equal(startedEvent.payload.taskType, "local_workflow");
+        assert.equal(startedEvent.payload.toolUseId, "toolu_workflow");
+      }
+
+      const updatedEvent = runtimeEvents.find((event) => event.type === "task.updated");
+      assert.equal(updatedEvent?.type, "task.updated");
+      if (updatedEvent?.type === "task.updated") {
+        assert.equal(updatedEvent.payload.status, "killed");
+        assert.equal(updatedEvent.payload.workflowName, "alvera-app-overhaul");
+      }
+      runtimeEventsFiber.interruptUnsafe();
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("closes out unfinished background runs when the session ends", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => runtimeEvents.push(event)),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "wf-orphan",
+        task_type: "local_workflow",
+        workflow_name: "long-running",
+        description: "Fan out across the repo",
+        session_id: "sdk-session-orphan",
+        uuid: "wf-orphan-start",
+      } as unknown as SDKMessage);
+      // Settled runs must not be reported twice.
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-done",
+        task_type: "local_bash",
+        description: "Run tests",
+        session_id: "sdk-session-orphan",
+        uuid: "task-done-start",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "system",
+        subtype: "task_notification",
+        task_id: "task-done",
+        status: "completed",
+        output_file: "/tmp/out",
+        summary: "Tests passed",
+        session_id: "sdk-session-orphan",
+        uuid: "task-done-notification",
+      } as unknown as SDKMessage);
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      yield* adapter.stopSession(THREAD_ID);
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      const completions = runtimeEvents.filter((event) => event.type === "task.completed");
+      assert.deepEqual(
+        completions.map((event) =>
+          event.type === "task.completed"
+            ? `${event.payload.taskId}:${event.payload.status}:${event.payload.reconciled ?? false}`
+            : "",
+        ),
+        ["task-done:completed:false", "wf-orphan:stopped:true"],
+      );
+      runtimeEventsFiber.interruptUnsafe();
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("adds background task tokens to the cumulative total, not the active window", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => runtimeEvents.push(event)),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: THREAD_ID,
+        input: "hello",
+        attachments: [],
+      });
+
+      // Authoritative main-thread reading first.
+      harness.query.emit({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        duration_ms: 1234,
+        duration_api_ms: 1200,
+        num_turns: 1,
+        result: "done",
+        stop_reason: "end_turn",
+        session_id: "sdk-session-task-usage-mixed",
+        usage: {
+          input_tokens: 4,
+          cache_creation_input_tokens: 2715,
+          cache_read_input_tokens: 21144,
+          output_tokens: 679,
+        },
+        modelUsage: {
+          "claude-opus-4-6": {
+            contextWindow: 200000,
+            maxOutputTokens: 64000,
           },
-        });
+        },
+      } as unknown as SDKMessage);
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-mixed-1",
+        task_type: "local_workflow",
+        workflow_name: "audit",
+        description: "Audit the module",
+        session_id: "sdk-session-task-usage-mixed",
+        uuid: "task-mixed-start",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "system",
+        subtype: "task_progress",
+        task_id: "task-mixed-1",
+        description: "Audit: sweep",
+        usage: { total_tokens: 100_000, tool_uses: 3, duration_ms: 900 },
+        session_id: "sdk-session-task-usage-mixed",
+        uuid: "task-mixed-progress-1",
+      } as unknown as SDKMessage);
+      // Cumulative per run: the second frame adds 50k of new work, not 150k.
+      harness.query.emit({
+        type: "system",
+        subtype: "task_progress",
+        task_id: "task-mixed-1",
+        description: "Audit: sweep",
+        usage: { total_tokens: 150_000, tool_uses: 4, duration_ms: 1200 },
+        session_id: "sdk-session-task-usage-mixed",
+        uuid: "task-mixed-progress-2",
+      } as unknown as SDKMessage);
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      const usageEvents = runtimeEvents.filter(
+        (event) => event.type === "thread.token-usage.updated",
+      );
+      const finalUsage = usageEvents.at(-1);
+      assert.equal(finalUsage?.type, "thread.token-usage.updated");
+      if (finalUsage?.type === "thread.token-usage.updated") {
+        assert.equal(finalUsage.payload.usage.usedTokens, 24542);
+        assert.equal(finalUsage.payload.usage.lastUsedTokens, 24542);
+        assert.equal(finalUsage.payload.usage.maxTokens, 200000);
+        assert.equal(finalUsage.payload.usage.totalProcessedTokens, 24542 + 150_000);
       }
-      assert.equal(progressEvent?.type, "task.progress");
-      if (usageEvent && progressEvent) {
-        assert.notStrictEqual(usageEvent.eventId, progressEvent.eventId);
-      }
+      runtimeEventsFiber.interruptUnsafe();
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
@@ -2071,10 +2424,10 @@ describe("ClaudeAdapterLive", () => {
       return Effect.gen(function* () {
         const adapter = yield* ClaudeAdapter;
 
-        const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 9).pipe(
-          Stream.runCollect,
-          Effect.forkChild,
-        );
+        const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+        const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+          Effect.sync(() => runtimeEvents.push(event)),
+        ).pipe(Effect.forkChild);
 
         yield* adapter.startSession({
           threadId: THREAD_ID,
@@ -2121,23 +2474,27 @@ describe("ClaudeAdapterLive", () => {
           },
         } as unknown as SDKMessage);
         harness.query.finish();
+        yield* Effect.yieldNow;
+        yield* Effect.yieldNow;
 
-        const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
         const usageEvents = runtimeEvents.filter(
           (event) => event.type === "thread.token-usage.updated",
         );
         const finalUsageEvent = usageEvents.at(-1);
         assert.equal(finalUsageEvent?.type, "thread.token-usage.updated");
         if (finalUsageEvent?.type === "thread.token-usage.updated") {
+          // The background task's 190k never becomes active context: the
+          // window reading comes from the result, clamped to its maximum.
           assert.deepEqual(finalUsageEvent.payload, {
             usage: {
-              usedTokens: 190000,
-              lastUsedTokens: 190000,
+              usedTokens: 200000,
+              lastUsedTokens: 200000,
               totalProcessedTokens: 535000,
               maxTokens: 200000,
             },
           });
         }
+        runtimeEventsFiber.interruptUnsafe();
       }).pipe(
         Effect.provideService(Random.Random, makeDeterministicRandomService()),
         Effect.provide(harness.layer),

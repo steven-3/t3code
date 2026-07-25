@@ -492,8 +492,9 @@ export function runtimeEventToActivities(
           createdAt: event.createdAt,
           tone: "info",
           kind: "task.started",
-          summary:
-            event.payload.taskType === "plan"
+          summary: event.payload.workflowName
+            ? `Workflow ${event.payload.workflowName} started`
+            : event.payload.taskType === "plan"
               ? "Plan task started"
               : event.payload.taskType
                 ? `${event.payload.taskType} task started`
@@ -501,6 +502,9 @@ export function runtimeEventToActivities(
           payload: {
             taskId: event.payload.taskId,
             ...(event.payload.taskType ? { taskType: event.payload.taskType } : {}),
+            ...(event.payload.workflowName ? { workflowName: event.payload.workflowName } : {}),
+            ...(event.payload.subagentType ? { subagentType: event.payload.subagentType } : {}),
+            ...(event.payload.toolUseId ? { toolUseId: event.payload.toolUseId } : {}),
             ...(event.payload.description
               ? { detail: truncateDetail(event.payload.description) }
               : {}),
@@ -531,6 +535,50 @@ export function runtimeEventToActivities(
             ...(event.payload.summary ? { summary: truncateDetail(event.payload.summary) } : {}),
             ...(event.payload.lastToolName ? { lastToolName: event.payload.lastToolName } : {}),
             ...(event.payload.usage !== undefined ? { usage: event.payload.usage } : {}),
+            ...(event.payload.taskType ? { taskType: event.payload.taskType } : {}),
+            ...(event.payload.workflowName ? { workflowName: event.payload.workflowName } : {}),
+            ...(event.payload.subagentType ? { subagentType: event.payload.subagentType } : {}),
+            ...(event.payload.toolUseId ? { toolUseId: event.payload.toolUseId } : {}),
+          },
+          turnId: toTurnId(event.turnId) ?? null,
+          ...maybeSequence,
+        },
+      ];
+    }
+
+    case "task.updated": {
+      // Only state that changes what a client shows is worth an activity row;
+      // bookkeeping-only patches (pause timers, description echoes) are not.
+      if (!event.payload.status && !event.payload.error) {
+        return [];
+      }
+
+      return [
+        {
+          id: event.eventId,
+          createdAt: event.createdAt,
+          tone: event.payload.status === "failed" || event.payload.error ? "error" : "info",
+          kind: "task.updated",
+          summary:
+            event.payload.status === "killed"
+              ? "Task stopped"
+              : event.payload.status === "failed"
+                ? "Task failed"
+                : event.payload.status
+                  ? `Task ${event.payload.status}`
+                  : "Task updated",
+          payload: {
+            taskId: event.payload.taskId,
+            ...(event.payload.status ? { status: event.payload.status } : {}),
+            ...(event.payload.description
+              ? { detail: truncateDetail(event.payload.description) }
+              : {}),
+            ...(event.payload.error ? { error: truncateDetail(event.payload.error) } : {}),
+            ...(event.payload.backgrounded !== undefined
+              ? { backgrounded: event.payload.backgrounded }
+              : {}),
+            ...(event.payload.taskType ? { taskType: event.payload.taskType } : {}),
+            ...(event.payload.workflowName ? { workflowName: event.payload.workflowName } : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -554,6 +602,11 @@ export function runtimeEventToActivities(
           payload: {
             taskId: event.payload.taskId,
             status: event.payload.status,
+            ...(event.payload.taskType ? { taskType: event.payload.taskType } : {}),
+            ...(event.payload.workflowName ? { workflowName: event.payload.workflowName } : {}),
+            ...(event.payload.subagentType ? { subagentType: event.payload.subagentType } : {}),
+            ...(event.payload.toolUseId ? { toolUseId: event.payload.toolUseId } : {}),
+            ...(event.payload.reconciled ? { reconciled: true } : {}),
             ...(taskTitle ? { title: truncateDetail(taskTitle, 120) } : {}),
             // summary + detail mirror task.progress: clients label the row from
             // summary and keep detail for the preview/expanded body.

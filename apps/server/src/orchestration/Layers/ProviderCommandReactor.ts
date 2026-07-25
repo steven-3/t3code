@@ -32,6 +32,7 @@ import type { ProviderServiceError } from "../../provider/Errors.ts";
 import { TextGeneration } from "../../textGeneration/TextGeneration.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { ProviderRegistry } from "../../provider/Services/ProviderRegistry.ts";
+import { claudeSelectionChangeRequiresSessionRestart } from "../../provider/Layers/ClaudeProvider.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import {
@@ -551,10 +552,20 @@ const make = Effect.gen(function* () {
         activeSession?.providerInstanceId !== requestedModelSelection.instanceId;
       const shouldRestartForModelChange = modelChanged && sessionModelSwitch === "unsupported";
       const previousModelSelection = threadModelSelections.get(threadId);
+      // Claude bakes option state (effort, ultracode, fast mode, thinking) into
+      // the CLI process at spawn, so changing it used to mean replacing the
+      // process. That also destroys whatever the process was orchestrating —
+      // background workflow runs and their agents. The adapter now applies what
+      // it can to the live session, leaving only the changes the flag layer
+      // cannot express to restart the session.
       const shouldRestartForModelSelectionChange =
         preferredProvider === "claudeAgent" &&
         requestedModelSelection !== undefined &&
-        !Equal.equals(previousModelSelection, requestedModelSelection);
+        !Equal.equals(previousModelSelection, requestedModelSelection) &&
+        claudeSelectionChangeRequiresSessionRestart(
+          previousModelSelection,
+          requestedModelSelection,
+        );
 
       if (
         !runtimeModeChanged &&
